@@ -3,9 +3,15 @@ use std::error::Error;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
+use crossterm::event::{
+    self as crossterm_event, Event as CrosstermEvent, KeyCode, KeyEventKind, KeyModifiers,
+};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use hound::{SampleFormat as WavSampleFormat, WavReader};
 use rdev::{Event, EventType};
 
@@ -54,6 +60,7 @@ struct SampleEngine {
     cursor: usize,
     grain_len: usize,
     active: Vec<GrainVoice>,
+    last_trigger_at: Option<Instant>,
 }
 
 impl SampleEngine {
@@ -64,13 +71,24 @@ impl SampleEngine {
             cursor: 0,
             grain_len: grain_len.max(32),
             active: Vec::with_capacity(MAX_ACTIVE_GRAINS),
+            last_trigger_at: None,
         }
     }
 
     fn trigger_forward_slice(&mut self) {
+        const MIN_TRIGGER_INTERVAL: Duration = Duration::from_millis(12);
+
         if self.samples.is_empty() {
             return;
         }
+
+        let now = Instant::now();
+        if let Some(last) = self.last_trigger_at {
+            if now.duration_since(last) < MIN_TRIGGER_INTERVAL {
+                return;
+            }
+        }
+        self.last_trigger_at = Some(now);
 
         let start = self.cursor;
         self.cursor = (self.cursor + self.grain_len) % self.samples.len();
@@ -287,9 +305,41 @@ fn run() -> Result<(), Box<dyn Error>> {
     stream.play()?;
 
     println!(
-        "TypeMusic running. Press any key globally to play the next slice of '{}' (Ctrl+C to stop).",
+        "TypeMusic running. Press any key globally or in this console to play the next slice of '{}' (Ctrl+C to stop).",
         wav_path
     );
+
+    let console_engine = Arc::clone(&engine);
+    thread::spawn(move || {
+        if let Err(err) = enable_raw_mode() {
+            eprintln!("Console raw-mode setup failed: {err}");
+            return;
+        }
+
+        loop {
+            match crossterm_event::read() {
+                Ok(CrosstermEvent::Key(key_event)) if key_event.kind == KeyEventKind::Press => {
+                    if key_event.code == KeyCode::Char('c')
+                        && key_event.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        let _ = disable_raw_mode();
+                        std::process::exit(0);
+                    }
+
+                    if let Ok(mut engine) = console_engine.lock() {
+                        engine.trigger_forward_slice();
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    eprintln!("Console key listener error: {err}");
+                    break;
+                }
+            }
+        }
+
+        let _ = disable_raw_mode();
+    });
 
     let listener_engine = Arc::clone(&engine);
     let callback = move |event: Event| {
